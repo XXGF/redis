@@ -403,6 +403,7 @@ static int sort_gp_desc(const void *a, const void *b) {
 
 /* GEOADD key long lat name [long2 lat2 name2 ... longN latN nameN] */
 void geoaddCommand(client *c) {
+    // 参数合法性校验
     /* Check arguments number for sanity. */
     if ((c->argc - 2) % 3 != 0) {
         /* Need an odd number of arguments if we got this far... */
@@ -410,7 +411,7 @@ void geoaddCommand(client *c) {
                          "[x2] [y2] [name2] ... ");
         return;
     }
-
+    // 提取用户输入的参数
     int elements = (c->argc - 2) / 3;
     int argc = 2+elements*2; /* ZADD key score ele ... */
     robj **argv = zcalloc(argc*sizeof(robj*));
@@ -421,10 +422,11 @@ void geoaddCommand(client *c) {
     /* Create the argument vector to call ZADD in order to add all
      * the score,value pairs to the requested zset, where score is actually
      * an encoded version of lat,long. */
+     // 遍历用户输入，创建出有序集合元素
     int i;
     for (i = 0; i < elements; i++) {
         double xy[2];
-
+        // 提取用户输入的经度和纬度
         if (extractLongLatOrReply(c, (c->argv+2)+(i*3),xy) == C_ERR) {
             for (i = 0; i < argc; i++)
                 if (argv[i]) decrRefCount(argv[i]);
@@ -433,11 +435,15 @@ void geoaddCommand(client *c) {
         }
 
         /* Turn the coordinates into the score of the element. */
+        // 根据坐标计算出 GeoHash值
         GeoHashBits hash;
         geohashEncodeWGS84(xy[0], xy[1], GEO_STEP_MAX, &hash);
+        // 将 geohash 值放到 52 个位上面
         GeoHashFix52Bits bits = geohashAlign52Bits(hash);
+        // 将 52 位 geohash 作为分值记录到元素里面
         robj *score = createObject(OBJ_STRING, sdsfromlonglong(bits));
         robj *val = c->argv[2 + i * 3 + 2];
+         // 设置有序集合元素的分值和名字
         argv[2+i*2] = score;
         argv[3+i*2] = val;
         incrRefCount(val);
@@ -445,6 +451,7 @@ void geoaddCommand(client *c) {
 
     /* Finally call ZADD that will do the work for us. */
     replaceClientCommandVector(c,argc,argv);
+    // 将刚才创建的元素全部添加到有序集合里面
     zaddCommand(c);
 }
 
@@ -465,6 +472,7 @@ void georadiusGeneric(client *c, int flags) {
     int storedist = 0; /* 0 for STORE, 1 for STOREDIST. */
 
     /* Look up the requested zset */
+    // 获取存储位置的有序集合
     robj *zobj = NULL;
     if ((zobj = lookupKeyReadOrReply(c, key, shared.emptymultibulk)) == NULL ||
         checkType(c, zobj, OBJ_ZSET)) {
@@ -472,13 +480,16 @@ void georadiusGeneric(client *c, int flags) {
     }
 
     /* Find long/lat to use for radius search based on inquiry type */
+    // 提取定义中心点的经纬度
     int base_args;
     double xy[2] = { 0 };
     if (flags & RADIUS_COORDS) {
+        // 使用用户输入的经纬度作为中心点
         base_args = 6;
         if (extractLongLatOrReply(c, c->argv + 2, xy) == C_ERR)
             return;
     } else if (flags & RADIUS_MEMBER) {
+         // 使用有序集合储存的经纬度作为中心点
         base_args = 5;
         robj *member = c->argv[2];
         if (longLatFromMember(zobj, member, xy) == C_ERR) {
@@ -491,6 +502,7 @@ void georadiusGeneric(client *c, int flags) {
     }
 
     /* Extract radius and units from arguments */
+    // 从参数中提取范围
     double radius_meters = 0, conversion = 1;
     if ((radius_meters = extractDistanceOrReply(c, c->argv + base_args - 2,
                                                 &conversion)) < 0) {
@@ -498,6 +510,7 @@ void georadiusGeneric(client *c, int flags) {
     }
 
     /* Discover and populate all optional parameters. */
+    // 提取所有可选参数
     int withdist = 0, withhash = 0, withcoords = 0;
     int sort = SORT_NONE;
     long long count = 0;
@@ -554,22 +567,28 @@ void georadiusGeneric(client *c, int flags) {
 
     /* COUNT without ordering does not make much sense, force ASC
      * ordering if COUNT was specified but no sorting was requested. */
+    // 指定排序方式
     if (count != 0 && sort == SORT_NONE) sort = SORT_ASC;
 
     /* Get all neighbor geohash boxes for our radius search */
+     // 定位中心点所处的范围
     GeoHashRadius georadius =
         geohashGetAreasByRadiusWGS84(xy[0], xy[1], radius_meters);
 
     /* Search the zset for all matching points */
     geoArray *ga = geoArrayCreate();
+    // TODO 对中心点以及它的八个方向进行查找，找出所有范围内的元素
     membersOfAllNeighbors(zobj, georadius, xy[0], xy[1], radius_meters, ga);
 
     /* If no matching results, the user gets an empty reply. */
+    // 没有匹配的位置，返回空列表
     if (ga->used == 0 && storekey == NULL) {
         addReply(c, shared.emptymultibulk);
         geoArrayFree(ga);
         return;
     }
+
+     // 有匹配的位置，继续执行以下动作……
 
     long result_length = ga->used;
     long returned_items = (count == 0 || result_length < count) ?
@@ -577,6 +596,7 @@ void georadiusGeneric(client *c, int flags) {
     long option_length = 0;
 
     /* Process [optional] requested sorting */
+     // 对结果进行排序
     if (sort == SORT_ASC) {
         qsort(ga->array, result_length, sizeof(geoPoint), sort_gp_asc);
     } else if (sort == SORT_DESC) {
@@ -588,6 +608,7 @@ void georadiusGeneric(client *c, int flags) {
 
         /* Our options are self-contained nested multibulk replies, so we
          * only need to track how many of those nested replies we return. */
+         // 根据用户给定的可选项，计算数组中的每个子数组需要包含多少个项
         if (withdist)
             option_length++;
 
@@ -604,6 +625,7 @@ void georadiusGeneric(client *c, int flags) {
         addReplyMultiBulkLen(c, returned_items);
 
         /* Finally send results back to the caller */
+         // 发送回复
         int i;
         for (i = 0; i < returned_items; i++) {
             geoPoint *gp = ga->array+i;
